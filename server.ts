@@ -3,6 +3,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} from '@simplewebauthn/server';
 import { Enquiry, Product } from './src/types.js';
 import { 
   saveEnquiry, 
@@ -222,94 +228,199 @@ const authenticateAdmin = (req: express.Request, res: express.Response, next: ex
     }
   });
 
-  // Issue custom challenge for Device Passkey signature flow
-  app.post('/api/admin/passkeys/challenge', async (req, res) => {
-    const { passkeyId } = req.body;
-    if (!passkeyId) {
-      return res.status(400).json({ error: 'Passkey Identifier required.' });
+  // Dynamic configuration helper for WebAuthn
+  const getWebAuthnConfig = (req: express.Request) => {
+    const host = req.headers.host || 'localhost:3000';
+    const hostname = host.split(':')[0];
+    const origin = req.headers.origin || (req.headers.referer ? new URL(req.headers.referer).origin : `http://${host}`);
+    return { rpID: hostname, origin };
+  };
+
+  // 1. Generate Registration Options (Authenticated)
+  app.get('/api/admin/passkeys/register-options', authenticateAdmin, async (req, res) => {
+    try {
+      const { rpID } = getWebAuthnConfig(req);
+      const settings = await getAdminSettings();
+      const passkeys = await getPasskeys();
+
+      const authHeader = req.headers.authorization!;
+      const token = authHeader.split(' ')[1];
+
+      const options = await generateRegistrationOptions({
+        rpName: 'CURATED Admin Console',
+        rpID,
+        userID: Buffer.from('admin-user'),
+        userName: settings.email,
+        userDisplayName: settings.alias || 'Administrator',
+        attestationType: 'none',
+        authenticatorSelection: {
+          residentKey: 'preferred',
+          userVerification: 'preferred',
+        },
+        excludeCredentials: passkeys.map((pk) => ({
+          id: pk.id,
+          type: 'public-key',
+        })),
+      });
+
+      ACTIVE_CHALLENGES.set(`reg:${token}`, {
+        challenge: options.challenge,
+        expires: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes
+      });
+
+      return res.json(options);
+    } catch (err: any) {
+      console.error('WebAuthn Registration Options Error:', err);
+      return res.status(500).json({ error: 'Failed to generate WebAuthn registration options: ' + err.message });
     }
-
-    const challenge = crypto.randomBytes(32).toString('hex');
-    ACTIVE_CHALLENGES.set(passkeyId, {
-      challenge,
-      expires: new Date(Date.now() + 2 * 60 * 1000) // 2 minutes
-    });
-
-    return res.json({ challenge });
   });
 
-  // Verify custom challenge asymmetric signature
-  app.post('/api/admin/passkeys/verify', async (req, res) => {
+  // 2. Verify Registration Response (Authenticated)
+  app.post('/api/admin/passkeys/register-verify', authenticateAdmin, async (req, res) => {
+    const { name, response } = req.body;
+    if (!name || !response) {
+      return res.status(400).json({ error: 'Name and WebAuthn response are required.' });
+    }
+
+    try {
+      const { rpID, origin } = getWebAuthnConfig(req);
+      const authHeader = req.headers.authorization!;
+      const token = authHeader.split(' ')[1];
+
+      const stored = ACTIVE_CHALLENGES.get(`reg:${token}`);
+      if (!stored || new Date() > stored.expires) {
+        return res.status(400).json({ error: 'Registration challenge expired or missing. Please restart registration.' });
+      }
+
+      const verification = await verifyRegistrationResponse({
+        response,
+        expectedChallenge: stored.challenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        requireUserVerification: false,
+      });
+
+      if (!verification.verified || !verification.registrationInfo) {
+        return res.status(400).json({ error: 'WebAuthn registration verification failed.' });
+      }
+
+      const { id, publicKey, counter } = verification.registrationInfo.credential;
+
+      // Clean up challenge
+      ACTIVE_CHALLENGES.delete(`reg:${token}`);
+
+      const passkeyData = JSON.stringify({
+        publicKey: Buffer.from(publicKey).toString('base64'),
+        counter,
+        transports: response.response.transports || [],
+      });
+
+      const success = await registerPasskey(id, name.trim(), passkeyData);
+      if (success) {
+        return res.json({ success: true, credentialID: id });
+      }
+
+      return res.status(500).json({ error: 'Failed to record public key to credentials store.' });
+    } catch (err: any) {
+      console.error('WebAuthn Registration Verification Error:', err);
+      return res.status(500).json({ error: 'WebAuthn verification failure: ' + err.message });
+    }
+  });
+
+  // 3. Generate Login Options (Unauthenticated)
+  app.post('/api/admin/passkeys/login-options', async (req, res) => {
+    try {
+      const { rpID } = getWebAuthnConfig(req);
+      const passkeys = await getPasskeys();
+
+      const options = await generateAuthenticationOptions({
+        rpID,
+        allowCredentials: passkeys.map((pk) => ({
+          id: pk.id,
+          type: 'public-key',
+        })),
+        userVerification: 'preferred',
+      });
+
+      const challengeId = crypto.randomUUID();
+      ACTIVE_CHALLENGES.set(`auth:${challengeId}`, {
+        challenge: options.challenge,
+        expires: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes
+      });
+
+      return res.json({ options, challengeId });
+    } catch (err: any) {
+      console.error('WebAuthn Login Options Error:', err);
+      return res.status(500).json({ error: 'Failed to generate WebAuthn login options: ' + err.message });
+    }
+  });
+
+  // 4. Verify Login Response (Unauthenticated)
+  app.post('/api/admin/passkeys/login-verify', async (req, res) => {
     const ip = getClientIP(req);
 
     const lockState = await checkIPLockState(ip);
     if (lockState.locked) {
-      return res.status(429).json({ error: 'Too many signature attempts. Locked out.', lockedUntil: lockState.lockedUntil });
+      return res.status(429).json({ error: 'Too many authentication attempts. Locked out.', lockedUntil: lockState.lockedUntil });
     }
 
-    const { passkeyId, signature, challenge } = req.body;
-    if (!passkeyId || !signature || !challenge) {
-      return res.status(400).json({ error: 'Missing challenge verification arguments.' });
+    const { challengeId, response } = req.body;
+    if (!challengeId || !response) {
+      return res.status(400).json({ error: 'Challenge session identifier and WebAuthn response are required.' });
     }
 
     try {
-      const storedChallenge = ACTIVE_CHALLENGES.get(passkeyId);
-      if (!storedChallenge || storedChallenge.challenge !== challenge || new Date() > storedChallenge.expires) {
+      const { rpID, origin } = getWebAuthnConfig(req);
+      const stored = ACTIVE_CHALLENGES.get(`auth:${challengeId}`);
+      if (!stored || new Date() > stored.expires) {
         await recordLoginAttempt(ip, false);
-        return res.status(400).json({ error: 'Challenge expired or mismatch.' });
+        return res.status(400).json({ error: 'Authentication challenge expired or missing. Please reload page.' });
       }
 
-      // Query matching passkey public key from DB
       const passkeys = await getPasskeys();
-      const passkey = passkeys.find((pk) => pk.id === passkeyId);
+      const passkey = passkeys.find((pk) => pk.id === response.id);
 
       if (!passkey) {
         await recordLoginAttempt(ip, false);
-        return res.status(400).json({ error: 'Device public key unrecognized.' });
+        return res.status(400).json({ error: 'Device credentials unrecognized by security system.' });
       }
 
-      // Parse JWK and verify signature
-      const jwk = JSON.parse(passkey.publicKey);
-      const isVerified = verifyEcdsaSignature(jwk, challenge, signature);
+      const credData = JSON.parse(passkey.publicKey);
 
-      if (!isVerified) {
+      const verification = await verifyAuthenticationResponse({
+        response,
+        expectedChallenge: stored.challenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        credential: {
+          id: passkey.id,
+          publicKey: Buffer.from(credData.publicKey, 'base64'),
+          counter: credData.counter || 0,
+          transports: credData.transports || [],
+        },
+        requireUserVerification: false,
+      });
+
+      if (!verification.verified || !verification.authenticationInfo) {
         const attempt = await recordLoginAttempt(ip, false);
-        await logAuditEvent(`SECURITY ALERT: Defective Passkey Signature verified for device "${passkey.name}" from IP ${ip}`);
-        return res.status(400).json({ error: 'Asymmetric verification failed. Invalid key pair.' });
+        await logAuditEvent(`SECURITY ALERT: WebAuthn signature failed for device "${passkey.name}" from IP ${ip}`);
+        return res.status(400).json({ error: 'Asymmetric biometric signature verification failed.' });
       }
 
-      // Clean up challenge
-      ACTIVE_CHALLENGES.delete(passkeyId);
+      // Clean up challenge and login attempts
+      ACTIVE_CHALLENGES.delete(`auth:${challengeId}`);
       await recordLoginAttempt(ip, true);
 
-      // Successful login!
+      // Issue dynamic session token
       const sessionToken = crypto.randomBytes(32).toString('hex');
       ACTIVE_SESSIONS.add(sessionToken);
 
-      await logAuditEvent(`PASSKEY ACCESS GRANTED: Authenticated using device passkey "${passkey.name}" [ID: ${passkeyId.substring(0, 8)}...]`);
+      await logAuditEvent(`PASSKEY ACCESS GRANTED: Authenticated using device passkey "${passkey.name}" [ID: ${passkey.id.substring(0, 8)}...]`);
 
       return res.json({ success: true, token: sessionToken });
     } catch (err: any) {
-      console.error(err);
-      return res.status(500).json({ error: 'Asymmetric decryption process error: ' + err.message });
-    }
-  });
-
-  // Register public key device passkey
-  app.post('/api/admin/passkeys/register', authenticateAdmin, async (req, res) => {
-    const { id, name, publicKey } = req.body;
-    if (!id || !name || !publicKey) {
-      return res.status(400).json({ error: 'Invalid registration details.' });
-    }
-
-    try {
-      const success = await registerPasskey(id, name, publicKey);
-      if (success) {
-        return res.json({ success: true });
-      }
-      return res.status(500).json({ error: 'Failed to record public key to credentials table.' });
-    } catch (err: any) {
-      return res.status(400).json({ error: err.message });
+      console.error('WebAuthn Login Verification Error:', err);
+      return res.status(500).json({ error: 'Asymmetric cryptographic verification error: ' + err.message });
     }
   });
 

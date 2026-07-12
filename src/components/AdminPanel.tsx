@@ -8,86 +8,12 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Enquiry, Product } from '../types';
 
+import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
+
 interface AdminPanelProps {
   onSelectProductById: (id: string) => void;
   onClose: () => void;
   onProductCatalogChanged?: () => void; // Trigger callback to reload catalog in parent
-}
-
-// INDEXEDDB KEY STORAGE ENGINE FOR ASYMMETRIC CRYPTOGRAPHIC PASSKEYS
-function openDB(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open('CuratedSecureKeyStore', 1);
-    request.onupgradeneeded = () => {
-      const db = request.result;
-      if (!db.objectStoreNames.contains('keys')) {
-        db.createObjectStore('keys');
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function savePrivateKey(id: string, key: CryptoKey): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('keys', 'readwrite');
-    const store = transaction.objectStore('keys');
-    const request = store.put(key, id);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function getPrivateKey(id: string): Promise<CryptoKey | null> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('keys', 'readonly');
-    const store = transaction.objectStore('keys');
-    const request = store.get(id);
-    request.onsuccess = () => resolve(request.result || null);
-    request.onerror = () => reject(request.error);
-  });
-}
-
-async function deletePrivateKey(id: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const transaction = db.transaction('keys', 'readwrite');
-    const store = transaction.objectStore('keys');
-    const request = store.delete(id);
-    request.onsuccess = () => resolve();
-    request.onerror = () => reject(request.error);
-  });
-}
-
-// CRYPTOGRAPHIC UTILITIES
-async function generatePasskeyPair(): Promise<{ publicKeyJwk: any, privateKey: CryptoKey }> {
-  const keyPair = await window.crypto.subtle.generateKey(
-    {
-      name: "ECDSA",
-      namedCurve: "P-256"
-    },
-    true,
-    ["sign", "verify"]
-  );
-  const publicKeyJwk = await window.crypto.subtle.exportKey("jwk", keyPair.publicKey);
-  return { publicKeyJwk, privateKey: keyPair.privateKey };
-}
-
-async function signChallenge(privateKey: CryptoKey, challenge: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const challengeBuffer = encoder.encode(challenge);
-  const signatureBuffer = await window.crypto.subtle.sign(
-    {
-      name: "ECDSA",
-      hash: { name: "SHA-256" }
-    },
-    privateKey,
-    challengeBuffer
-  );
-  return btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
 }
 
 export default function AdminPanel({ onSelectProductById, onClose, onProductCatalogChanged }: AdminPanelProps) {
@@ -359,65 +285,55 @@ export default function AdminPanel({ onSelectProductById, onClose, onProductCata
     }
   };
 
-  // Login using registered device Private Key (Cryptographic Passkey)
+  // Login using registered device Passkey (Fingerprint / Face ID / PIN)
   const handlePasskeyLogin = async () => {
-    if (!detectedPasskeyId) return;
     setAuthError(null);
     setIsLoggingIn(true);
 
     try {
-      // 1. Fetch challenge from server
-      const challengeRes = await fetch('/api/admin/passkeys/challenge', {
+      // 1. Fetch authentication options from server
+      const optionsRes = await fetch('/api/admin/passkeys/login-options', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ passkeyId: detectedPasskeyId })
       });
 
-      if (!challengeRes.ok) {
-        const errorData = await challengeRes.json();
-        setAuthError(errorData.error || 'Failed to acquire challenge.');
+      if (!optionsRes.ok) {
+        const errorData = await optionsRes.json();
+        setAuthError(errorData.error || 'Failed to fetch security credentials.');
         setIsLoggingIn(false);
         return;
       }
 
-      const { challenge } = await challengeRes.json();
+      const { options, challengeId } = await optionsRes.json();
 
-      // 2. Fetch Private Key from IndexedDB
-      const privateKey = await getPrivateKey(detectedPasskeyId);
-      if (!privateKey) {
-        setAuthError('Terminal private key is missing from IndexedDB or corrupted.');
-        setIsLoggingIn(false);
-        return;
-      }
+      // 2. Call startAuthentication from SimpleWebAuthn browser client
+      const authResponse = await startAuthentication({ optionsJSON: options });
 
-      // 3. Sign challenge using SubtleCrypto
-      const signature = await signChallenge(privateKey, challenge);
-
-      // 4. Verify signature on server
-      const verifyRes = await fetch('/api/admin/passkeys/verify', {
+      // 3. Send verification response to server
+      const verifyRes = await fetch('/api/admin/passkeys/login-verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          passkeyId: detectedPasskeyId,
-          challenge,
-          signature
+          challengeId,
+          response: authResponse
         })
       });
 
       const verifyData = await verifyRes.json();
       if (verifyRes.ok) {
+        // Successful login! Store the session token.
         localStorage.setItem('curated_admin_token', verifyData.token);
         setToken(verifyData.token);
       } else {
         if (verifyRes.status === 429) {
           handleLockout(verifyData.lockedUntil);
         } else {
-          setAuthError(verifyData.error || 'Cryptographic signature verification declined.');
+          setAuthError(verifyData.error || 'Biometric authentication verification declined.');
         }
       }
     } catch (err: any) {
       console.error(err);
-      setAuthError('Secure Crypto element verification failed: ' + err.message);
+      setAuthError('Biometric verification failed or was cancelled: ' + err.message);
     } finally {
       setIsLoggingIn(false);
     }
@@ -646,7 +562,7 @@ export default function AdminPanel({ onSelectProductById, onClose, onProductCata
     }
   };
 
-  // Register modern cryptographic asymmetric device passkey
+  // Register standard WebAuthn Passkey (Fingerprint / Face ID / Security Key)
   const handleRegisterDevicePasskey = async (e: React.FormEvent) => {
     e.preventDefault();
     setPasskeyRegError(null);
@@ -666,46 +582,49 @@ export default function AdminPanel({ onSelectProductById, onClose, onProductCata
     }
 
     try {
-      // 1. Generate Asymmetric Keypair locally
-      const { publicKeyJwk, privateKey } = await generatePasskeyPair();
-      
-      // 2. Generate random ID for this passkey
-      const passkeyId = 'pk_' + crypto.randomUUID();
+      // 1. Fetch registration options from server
+      const optionsRes = await fetch('/api/admin/passkeys/register-options', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!optionsRes.ok) {
+        const errorData = await optionsRes.json();
+        throw new Error(errorData.error || 'Failed to fetch registration options.');
+      }
+      const optionsJSON = await optionsRes.json();
 
-      // 3. Register public key on server
-      const res = await fetch('/api/admin/passkeys/register', {
+      // 2. Call startRegistration from SimpleWebAuthn browser client
+      const regResponse = await startRegistration({ optionsJSON });
+
+      // 3. Send verification response to server
+      const verifyRes = await fetch('/api/admin/passkeys/register-verify', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
-          id: passkeyId,
           name: passkeyRegName.trim(),
-          publicKey: JSON.stringify(publicKeyJwk)
+          response: regResponse
         })
       });
 
-      const data = await res.json();
-      if (res.ok) {
-        // Save private key to device IndexedDB
-        await savePrivateKey(passkeyId, privateKey);
-        
-        // Save passkey tracking metadata to localStorage so browser remembers
-        localStorage.setItem('curated_passkey_id', passkeyId);
+      const verifyData = await verifyRes.json();
+      if (verifyRes.ok) {
+        // Save the registered credential ID in local storage so browser remembers
+        localStorage.setItem('curated_passkey_id', verifyData.credentialID);
         
         setHasPasskeyOnDevice(true);
-        setDetectedPasskeyId(passkeyId);
+        setDetectedPasskeyId(verifyData.credentialID);
         setPasskeyRegSuccess(true);
         setPasskeyRegName('');
         
         loadDashboardData();
       } else {
-        setPasskeyRegError(data.error || 'Asymmetric registration declined by server.');
+        setPasskeyRegError(verifyData.error || 'Passkey registration rejected by security server.');
       }
     } catch (err: any) {
       console.error(err);
-      setPasskeyRegError('Decryption engine or IndexedDB writing error: ' + err.message);
+      setPasskeyRegError('Fingerprint/Passkey setup cancelled or failed: ' + err.message);
     } finally {
       setRegisteringPasskey(false);
     }
@@ -724,7 +643,6 @@ export default function AdminPanel({ onSelectProductById, onClose, onProductCata
         const currentLocal = localStorage.getItem('curated_passkey_id');
         if (currentLocal === id) {
           localStorage.removeItem('curated_passkey_id');
-          await deletePrivateKey(id);
           setHasPasskeyOnDevice(false);
           setDetectedPasskeyId(null);
         }
